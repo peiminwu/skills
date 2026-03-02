@@ -1,0 +1,4 @@
+interface:
+  display_name: "Company Red Flag Scan"
+  short_description: "按清单排查上市公司做空、处罚、财务造假、诉讼与负面舆情"
+  default_prompt: "Use $company-red-flag-scan to investigate a listed company's red flags in Chinese and return a concise checklist-based summary with links."
