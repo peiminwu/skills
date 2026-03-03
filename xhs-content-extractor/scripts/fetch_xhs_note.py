@@ -50,6 +50,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-retries", type=int, default=DEFAULT_MAX_RETRIES, help="Retry times (default: 3)")
     parser.add_argument("--timeout-sec", type=int, default=DEFAULT_TIMEOUT_SEC, help="Timeout seconds (default: 30)")
     parser.add_argument("--show-browser", action="store_true", help="Show Safari window while running")
+    parser.add_argument(
+        "--use-active-tab",
+        action="store_true",
+        help="Reuse current Safari front tab session (no Selenium)",
+    )
     return parser.parse_args()
 
 
@@ -161,6 +166,109 @@ class SafariPage:
         return self.driver.current_url or ""
 
 
+class SafariActiveTabPage:
+    def __init__(self, timeout_ms: int) -> None:
+        self.timeout_ms = timeout_ms
+
+    def goto(self, url: str, timeout_ms: int | None = None, timeout: int | None = None) -> None:
+        timeout_val = timeout_ms if timeout_ms is not None else timeout
+        if timeout_val is None:
+            timeout_val = self.timeout_ms
+        subprocess.run(
+            [
+                "osascript",
+                "-e",
+                "on run argv",
+                "-e",
+                'tell application "Safari"',
+                "-e",
+                'if (count of windows) = 0 then error "No Safari window"',
+                "-e",
+                "set current tab of front window to (current tab of front window)",
+                "-e",
+                "set URL of current tab of front window to item 1 of argv",
+                "-e",
+                "end tell",
+                "-e",
+                "end run",
+                url,
+            ],
+            check=True,
+        )
+        self.wait_for_load_state("domcontentloaded", timeout_ms=timeout_val)
+
+    def wait_for_timeout(self, ms: int) -> None:
+        time.sleep(max(0, ms) / 1000)
+
+    def wait_for_load_state(self, _state: str, timeout_ms: int | None = None, timeout: int | None = None) -> None:
+        timeout_val = timeout_ms if timeout_ms is not None else timeout
+        if timeout_val is None:
+            timeout_val = self.timeout_ms
+        end = time.time() + (timeout_val / 1000)
+        while time.time() < end:
+            ready = self.evaluate("() => document.readyState")
+            if ready == "complete":
+                return
+            time.sleep(0.2)
+
+    def evaluate(self, script: str) -> Any:
+        expr = " ".join(script.strip().splitlines())
+        js = f"JSON.stringify((() => {{ const value = ({expr})(); return value === undefined ? null : value; }})())"
+        try:
+            proc = subprocess.run(
+                [
+                    "osascript",
+                    "-e",
+                    "on run argv",
+                    "-e",
+                    'tell application "Safari"',
+                    "-e",
+                    'if (count of windows) = 0 then error "No Safari window"',
+                    "-e",
+                    "set t to current tab of front window",
+                    "-e",
+                    "set js to item 1 of argv",
+                    "-e",
+                    "try",
+                    "-e",
+                    "return do JavaScript js in t",
+                    "-e",
+                    "on error",
+                    "-e",
+                    "return missing value",
+                    "-e",
+                    "end try",
+                    "-e",
+                    "end tell",
+                    "-e",
+                    "end run",
+                    js,
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        except subprocess.CalledProcessError as exc:
+            raise RuntimeError(exc.stderr.strip() or "Safari JavaScript execution failed") from exc
+        out = (proc.stdout or "").strip()
+        if out == "" or out.lower() == "missing value":
+            return None
+        if out in {"true", "false"}:
+            return out == "true"
+        try:
+            return json.loads(out)
+        except Exception:
+            return out
+
+    def title(self) -> str:
+        value = self.evaluate("() => document.title")
+        return value or ""
+
+    def current_url(self) -> str:
+        value = self.evaluate("() => window.location.href")
+        return value or ""
+
+
 def launch_safari_page(timeout_ms: int) -> tuple[Any, SafariPage]:
     try:
         from selenium import webdriver
@@ -175,6 +283,11 @@ def launch_safari_page(timeout_ms: int) -> tuple[Any, SafariPage]:
         raise RuntimeError(
             "无法启动 Safari 自动化。请在 Safari 开启“Develop > Allow Remote Automation”，并保持已登录小红书。"
         ) from exc
+
+
+def launch_active_safari_page(timeout_ms: int) -> tuple[Any, SafariActiveTabPage]:
+    page = SafariActiveTabPage(timeout_ms=timeout_ms)
+    return None, page
 
 
 def hide_safari_ui() -> None:
@@ -239,9 +352,9 @@ def is_login_page_text(page: Any) -> bool:
                 ];
                 if (keys.some(k => text.includes(k))) return true;
                 const inputs = [
-                    'input[type=\"password\"]',
-                    'input[name*=\"phone\"]',
-                    'input[placeholder*=\"验证码\"]',
+                    'input[type="password"]',
+                    'input[name*="phone"]',
+                    'input[placeholder*="验证码"]',
                 ];
                 return inputs.some(s => document.querySelector(s));
             }
@@ -753,9 +866,12 @@ def main() -> int:
     page = None
 
     try:
-        driver, page = launch_safari_page(timeout_ms=timeout_ms)
-        if not args.show_browser:
-            hide_safari_ui()
+        if args.use_active_tab:
+            driver, page = launch_active_safari_page(timeout_ms=timeout_ms)
+        else:
+            driver, page = launch_safari_page(timeout_ms=timeout_ms)
+            if not args.show_browser:
+                hide_safari_ui()
 
         log(f"Opening URL: {url}")
 
@@ -780,7 +896,30 @@ def main() -> int:
             (login_page or note_data.title in {"小红书 - 你的生活兴趣社区", "小红书"})
             and not (has_text_block or has_image_block)
         ):
-            raise RuntimeError("需重新登录小红书：当前页面显示登录拦截。")
+            if not args.use_active_tab:
+                log("Detected login intercept in automated Safari session; retrying with active Safari tab.")
+                try:
+                    driver.quit()
+                except Exception:
+                    pass
+                driver = None
+                page = launch_active_safari_page(timeout_ms=timeout_ms)[1]
+                with_retry(args.max_retries, _goto)
+                final_url = page.current_url()
+                input_id = extract_note_id_if_present(url)
+                final_id = extract_note_id_if_present(final_url)
+                if input_id and final_id and input_id != final_id:
+                    raise RuntimeError("页面已跳转到不同笔记，跳过保存与OCR。")
+                wait_for_content(page, timeout_ms=min(5000, timeout_ms))
+                note_data = build_note_data(page, url)
+                has_text_block = any((b.get("type") == "text" and (b.get("text") or "").strip()) for b in note_data.blocks)
+                has_image_block = any(b.get("type") == "image" for b in note_data.blocks)
+                login_page = is_login_required(page) or is_login_page_text(page)
+            if (
+                (login_page or note_data.title in {"小红书 - 你的生活兴趣社区", "小红书"})
+                and not (has_text_block or has_image_block)
+            ):
+                raise RuntimeError("需重新登录小红书：当前页面显示登录拦截。")
         invalid_titles = {"小红书 - 你的生活兴趣社区", "小红书", "登录后推荐更懂你的笔记"}
         if note_data.title in invalid_titles:
             # Give it one more chance to load real content.
