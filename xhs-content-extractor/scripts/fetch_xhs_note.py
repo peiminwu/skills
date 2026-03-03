@@ -626,6 +626,66 @@ def build_note_data(page: Any, url: str) -> NoteData:
     )
 
 
+def detect_page_media(page: Any) -> dict[str, Any]:
+    data = page.evaluate(
+        r"""
+        () => {
+            const imgs = Array.from(document.querySelectorAll('img'));
+            const candidateUrls = [];
+            let loadedCandidateCount = 0;
+            for (const img of imgs) {
+                const src = img.currentSrc || img.src || img.getAttribute('data-src') || '';
+                if (!src || !/^https?:\/\//.test(src)) continue;
+                if (/avatar|profile|icon|emoji/i.test(src)) continue;
+                if (!/xhs|xhscdn|sns-webpic/i.test(src)) continue;
+                candidateUrls.push(src);
+                const rect = img.getBoundingClientRect();
+                if (rect.width > 80 && rect.height > 80) loadedCandidateCount += 1;
+            }
+            return {
+                page_img_count: imgs.length,
+                candidate_image_count: Array.from(new Set(candidateUrls)).length,
+                loaded_candidate_count: loadedCandidateCount,
+            };
+        }
+        """
+    )
+    if not isinstance(data, dict):
+        return {
+            "page_img_count": 0,
+            "candidate_image_count": 0,
+            "loaded_candidate_count": 0,
+        }
+    return {
+        "page_img_count": int(data.get("page_img_count") or 0),
+        "candidate_image_count": int(data.get("candidate_image_count") or 0),
+        "loaded_candidate_count": int(data.get("loaded_candidate_count") or 0),
+    }
+
+
+def count_image_blocks(note_data: NoteData) -> int:
+    return sum(1 for block in note_data.blocks if block.get("type") == "image")
+
+
+def collect_note_data(page: Any, url: str, timeout_ms: int) -> tuple[NoteData, dict[str, Any]]:
+    note_data = build_note_data(page, url)
+    media_info = detect_page_media(page)
+
+    retries = 0
+    while media_info["candidate_image_count"] > 0 and count_image_blocks(note_data) == 0 and retries < 3:
+        retries += 1
+        log(
+            "Detected candidate page images but extracted 0 image blocks; "
+            f"retrying parse ({retries}/3)."
+        )
+        time.sleep(1.0)
+        wait_for_content(page, timeout_ms=min(2000, timeout_ms))
+        note_data = build_note_data(page, url)
+        media_info = detect_page_media(page)
+
+    return note_data, media_info
+
+
 def download_image(url: str, target: Path, timeout_sec: int, max_retries: int) -> None:
     if url.startswith("//"):
         url = "https:" + url
@@ -888,7 +948,7 @@ def main() -> int:
         if input_id and final_id and input_id != final_id:
             raise RuntimeError("页面已跳转到不同笔记，跳过保存与OCR。")
         wait_for_content(page, timeout_ms=min(5000, timeout_ms))
-        note_data = build_note_data(page, url)
+        note_data, media_info = collect_note_data(page, url, timeout_ms=timeout_ms)
         has_text_block = any((b.get("type") == "text" and (b.get("text") or "").strip()) for b in note_data.blocks)
         has_image_block = any(b.get("type") == "image" for b in note_data.blocks)
         login_page = is_login_required(page) or is_login_page_text(page)
@@ -911,7 +971,7 @@ def main() -> int:
                 if input_id and final_id and input_id != final_id:
                     raise RuntimeError("页面已跳转到不同笔记，跳过保存与OCR。")
                 wait_for_content(page, timeout_ms=min(5000, timeout_ms))
-                note_data = build_note_data(page, url)
+                note_data, media_info = collect_note_data(page, url, timeout_ms=timeout_ms)
                 has_text_block = any((b.get("type") == "text" and (b.get("text") or "").strip()) for b in note_data.blocks)
                 has_image_block = any(b.get("type") == "image" for b in note_data.blocks)
                 login_page = is_login_required(page) or is_login_page_text(page)
@@ -924,7 +984,7 @@ def main() -> int:
         if note_data.title in invalid_titles:
             # Give it one more chance to load real content.
             wait_for_content(page, timeout_ms=min(15000, timeout_ms))
-            note_data = build_note_data(page, url)
+            note_data, media_info = collect_note_data(page, url, timeout_ms=timeout_ms)
             has_text_block = any((b.get("type") == "text" and (b.get("text") or "").strip()) for b in note_data.blocks)
             has_image_block = any(b.get("type") == "image" for b in note_data.blocks)
         if note_data.title in invalid_titles and not (has_text_block or has_image_block):
@@ -1028,10 +1088,17 @@ def main() -> int:
         header = note_data.title.strip()
         if note_data.author:
             header += "\n\n" + f"作者: {note_data.author}"
+        extracted_images = count_image_blocks(note_data)
         body = "".join(body_segments).strip()
         content = (header + ("\n\n" + body if body else "")).strip() + "\n"
         txt_path.write_text(content, encoding=args.encoding)
 
+        print(
+            "图片检测: "
+            f"页面候选图片 {media_info['candidate_image_count']} 张, "
+            f"实际提取图片 {extracted_images} 张",
+            file=sys.stderr,
+        )
         print(str(txt_path))
         return 0
 
