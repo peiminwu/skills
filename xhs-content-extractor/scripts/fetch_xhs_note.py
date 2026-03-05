@@ -667,6 +667,15 @@ def count_image_blocks(note_data: NoteData) -> int:
     return sum(1 for block in note_data.blocks if block.get("type") == "image")
 
 
+def should_retry_note_extraction(media_info: dict[str, Any], extracted_images: int) -> bool:
+    candidate_count = int(media_info.get("candidate_image_count") or 0)
+    if candidate_count <= 0:
+        return False
+    if extracted_images >= candidate_count:
+        return False
+    return extracted_images <= max(1, candidate_count // 2)
+
+
 def collect_note_data(page: Any, url: str, timeout_ms: int) -> tuple[NoteData, dict[str, Any]]:
     note_data = build_note_data(page, url)
     media_info = detect_page_media(page)
@@ -912,6 +921,111 @@ def ensure_paths(out_dir: Path, file_stem: str) -> tuple[Path, Path]:
     return txt_path, image_dir
 
 
+def render_note_content(
+    note_data: NoteData,
+    media_info: dict[str, Any],
+    txt_path: Path,
+    image_dir: Path,
+    args: argparse.Namespace,
+    paddle_ocr_cls: Any,
+) -> tuple[int, Any]:
+    body_segments: list[str] = []
+    existing_text_for_dedupe = ""
+
+    ocr_engine: Any | None = None
+    image_counter = 0
+    total_images = count_image_blocks(note_data)
+    deferred_first_image: list[str] | None = None
+
+    for block in note_data.blocks:
+        block_type = block.get("type")
+
+        if block_type == "text":
+            content = (block.get("text") or "").strip()
+            if content:
+                indented = indent_paragraphs(content)
+                body_segments.append(indented)
+                existing_text_for_dedupe += "\n" + indented
+            continue
+
+        if block_type != "image":
+            continue
+
+        image_counter += 1
+        image_url = (block.get("src") or "").strip()
+        if not image_url:
+            line = f"[图片{image_counter} OCR失败：empty image url]"
+            if image_counter == 1 and total_images > 1:
+                deferred_first_image = [line]
+            else:
+                body_segments.append(line)
+                existing_text_for_dedupe += "\n" + line
+            continue
+
+        image_path = image_dir / f"image_{image_counter:03d}.jpg"
+
+        try:
+            log(f"OCR processing image {image_counter} ...")
+            download_image(image_url, image_path, timeout_sec=args.timeout_sec, max_retries=args.max_retries)
+            if ocr_engine is None:
+                ocr_engine = paddle_ocr_cls(
+                    lang="ch",
+                    ocr_version="PP-OCRv4",
+                    use_doc_orientation_classify=False,
+                    use_doc_unwarping=False,
+                    use_textline_orientation=False,
+                    text_det_limit_side_len=960,
+                    text_recognition_batch_size=6,
+                )
+
+            ocr_input = prepare_image_for_ocr(image_path, max_side=1280)
+            ocr_text = run_ocr(ocr_engine, ocr_input)
+            if ocr_input != image_path and ocr_input.exists():
+                ocr_input.unlink(missing_ok=True)
+            if not ocr_text:
+                raise RuntimeError("OCR empty result")
+
+            if is_duplicate_ocr_block(ocr_text, existing_text_for_dedupe):
+                continue
+
+            if image_counter == 1 and total_images > 1:
+                deferred_first_image = [ocr_text]
+            else:
+                indented_ocr = indent_paragraphs(ocr_text)
+                body_segments.append(indented_ocr)
+                existing_text_for_dedupe += "\n" + indented_ocr
+        except Exception as exc:  # noqa: BLE001
+            error_text = str(exc)
+            line = f"[图片{image_counter} OCR失败：{error_text}]"
+            if image_counter == 1 and total_images > 1:
+                deferred_first_image = [line]
+            else:
+                body_segments.append(line)
+                existing_text_for_dedupe += "\n" + line
+
+    if deferred_first_image:
+        if not is_duplicate_ocr_block("\n".join(deferred_first_image), existing_text_for_dedupe):
+            indented_deferred = [indent_paragraphs(x) for x in deferred_first_image]
+            body_segments.extend(indented_deferred)
+            existing_text_for_dedupe += "\n" + "\n".join(indented_deferred)
+
+    header = note_data.title.strip()
+    if note_data.author:
+        header += "\n\n" + f"作者: {note_data.author}"
+    body = "".join(body_segments).strip()
+    content = (header + ("\n\n" + body if body else "")).strip() + "\n"
+    txt_path.write_text(content, encoding=args.encoding)
+
+    extracted_images = count_image_blocks(note_data)
+    print(
+        "图片检测: "
+        f"页面候选图片 {media_info['candidate_image_count']} 张, "
+        f"实际提取图片 {extracted_images} 张",
+        file=sys.stderr,
+    )
+    return extracted_images, ocr_engine
+
+
 def main() -> int:
     args = parse_args()
     from paddleocr import PaddleOCR
@@ -992,113 +1106,36 @@ def main() -> int:
         output_stem = safe_filename(note_data.title, note_data.note_id)
         txt_path, image_dir = ensure_paths(out_dir, output_stem)
 
-        body_segments: list[str] = []
-        existing_text_for_dedupe = ""
-
-        ocr_engine: Any | None = None
-        image_counter = 0
-        failed_images: list[dict[str, Any]] = []
-        total_images = sum(1 for block in note_data.blocks if block.get("type") == "image")
-        deferred_first_image: list[str] | None = None
-
-        for block in note_data.blocks:
-            block_type = block.get("type")
-
-            if block_type == "text":
-                content = (block.get("text") or "").strip()
-                if content:
-                    indented = indent_paragraphs(content)
-                    body_segments.append(indented)
-                    existing_text_for_dedupe += "\n" + indented
-                continue
-
-            if block_type != "image":
-                continue
-
-            image_counter += 1
-            image_url = (block.get("src") or "").strip()
-            if not image_url:
-                failed_images.append({
-                    "index": image_counter,
-                    "url": "",
-                    "error": "empty image url",
-                })
-                line = f"[图片{image_counter} OCR失败：empty image url]"
-                if image_counter == 1 and total_images > 1:
-                    deferred_first_image = [line]
-                else:
-                    body_segments.append(line)
-                    existing_text_for_dedupe += "\n" + line
-                continue
-
-            image_path = image_dir / f"image_{image_counter:03d}.jpg"
-
-            try:
-                log(f"OCR processing image {image_counter} ...")
-                download_image(image_url, image_path, timeout_sec=args.timeout_sec, max_retries=args.max_retries)
-                if ocr_engine is None:
-                    ocr_engine = PaddleOCR(
-                        lang="ch",
-                        ocr_version="PP-OCRv4",
-                        use_doc_orientation_classify=False,
-                        use_doc_unwarping=False,
-                        use_textline_orientation=False,
-                        text_det_limit_side_len=960,
-                        text_recognition_batch_size=6,
-                    )
-
-                ocr_input = prepare_image_for_ocr(image_path, max_side=1280)
-                ocr_text = run_ocr(ocr_engine, ocr_input)
-                if ocr_input != image_path and ocr_input.exists():
-                    ocr_input.unlink(missing_ok=True)
-                if not ocr_text:
-                    raise RuntimeError("OCR empty result")
-
-                if is_duplicate_ocr_block(ocr_text, existing_text_for_dedupe):
-                    continue
-
-                if image_counter == 1 and total_images > 1:
-                    deferred_first_image = [ocr_text]
-                else:
-                    indented_ocr = indent_paragraphs(ocr_text)
-                    body_segments.append(indented_ocr)
-                    existing_text_for_dedupe += "\n" + indented_ocr
-            except Exception as exc:  # noqa: BLE001
-                error_text = str(exc)
-                failed_images.append(
-                    {
-                        "index": image_counter,
-                        "url": image_url,
-                        "error": error_text,
-                    }
-                )
-                line = f"[图片{image_counter} OCR失败：{error_text}]"
-                if image_counter == 1 and total_images > 1:
-                    deferred_first_image = [line]
-                else:
-                    body_segments.append(line)
-                    existing_text_for_dedupe += "\n" + line
-
-        if deferred_first_image:
-            if not is_duplicate_ocr_block("\n".join(deferred_first_image), existing_text_for_dedupe):
-                indented_deferred = [indent_paragraphs(x) for x in deferred_first_image]
-                body_segments.extend(indented_deferred)
-                existing_text_for_dedupe += "\n" + "\n".join(indented_deferred)
-
-        header = note_data.title.strip()
-        if note_data.author:
-            header += "\n\n" + f"作者: {note_data.author}"
-        extracted_images = count_image_blocks(note_data)
-        body = "".join(body_segments).strip()
-        content = (header + ("\n\n" + body if body else "")).strip() + "\n"
-        txt_path.write_text(content, encoding=args.encoding)
-
-        print(
-            "图片检测: "
-            f"页面候选图片 {media_info['candidate_image_count']} 张, "
-            f"实际提取图片 {extracted_images} 张",
-            file=sys.stderr,
+        extracted_images, _ocr_engine = render_note_content(
+            note_data=note_data,
+            media_info=media_info,
+            txt_path=txt_path,
+            image_dir=image_dir,
+            args=args,
+            paddle_ocr_cls=PaddleOCR,
         )
+
+        reruns = 0
+        while should_retry_note_extraction(media_info, extracted_images) and reruns < 2:
+            reruns += 1
+            log(
+                "Detected suspicious image extraction mismatch; "
+                f"retrying full note extraction ({reruns}/2)."
+            )
+            with_retry(args.max_retries, _goto)
+            wait_for_content(page, timeout_ms=min(5000, timeout_ms))
+            note_data, media_info = collect_note_data(page, url, timeout_ms=timeout_ms)
+            output_stem = safe_filename(note_data.title, note_data.note_id)
+            txt_path, image_dir = ensure_paths(out_dir, output_stem)
+            extracted_images, _ocr_engine = render_note_content(
+                note_data=note_data,
+                media_info=media_info,
+                txt_path=txt_path,
+                image_dir=image_dir,
+                args=args,
+                paddle_ocr_cls=PaddleOCR,
+            )
+
         print(str(txt_path))
         return 0
 
